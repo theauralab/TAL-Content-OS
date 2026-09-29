@@ -1,0 +1,730 @@
+// The Aura Lab Content OS — Prisma Schema
+// Covers the full data model from the spec. Phase 1 wires up Organization,
+// User, Client, Brand, Role/Permission and Notification (for real-time).
+// Everything else is modeled now so Phase 2-4 features slot in without
+// migrations that break existing data.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------- ENUMS ----------
+
+enum RoleName {
+  SUPER_ADMIN
+  AGENCY_MANAGER
+  DESIGNER
+  VIDEO_EDITOR
+  CONTENT_WRITER
+  SEO_SPECIALIST
+  MEDIA_BUYER
+  CLIENT
+}
+
+enum ContentType {
+  INSTAGRAM_REEL
+  INSTAGRAM_CAROUSEL
+  INSTAGRAM_STORY
+  INSTAGRAM_STATIC
+  FACEBOOK_POST
+  LINKEDIN_POST
+  YOUTUBE_VIDEO
+  YOUTUBE_SHORTS
+  PINTEREST_PIN
+  GOOGLE_BUSINESS_POST
+  REDDIT_CONTENT
+  QUORA_CONTENT
+  BLOG
+  EMAIL_CAMPAIGN
+}
+
+// Two client gates:
+//   1. PLAN     — script + caption + SEO + hashtags   (CLIENT_REVIEW -> APPROVED = "plan approved")
+//   2. CREATIVE — the finished reel / carousel / static (CREATIVE_REVIEW -> READY_TO_PUBLISH)
+// Values are only ever appended, so existing rows and data keep working.
+enum ContentStatus {
+  DRAFT
+  INTERNAL_REVIEW
+  CLIENT_REVIEW
+  CHANGES_REQUESTED
+  APPROVED
+  IN_PRODUCTION
+  CREATIVE_REVIEW
+  CREATIVE_CHANGES_REQUESTED
+  READY_TO_PUBLISH
+  SCHEDULED
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ApprovalStage {
+  PLAN
+  CREATIVE
+}
+
+enum CreativeKind {
+  FILE
+  LINK
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  DONE
+}
+
+enum AdPlatform {
+  META
+  GOOGLE
+  LINKEDIN
+  YOUTUBE
+}
+
+// ---------- CORE TENANCY ----------
+
+model Organization {
+  id        String    @id @default(cuid())
+  name      String
+  slug      String    @unique
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  users   User[]
+  clients Client[]
+  roles   Role[]
+}
+
+model User {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name         String
+  email        String  @unique
+  passwordHash String?
+  image        String?
+  roleId       String
+  role         Role    @relation(fields: [roleId], references: [id])
+
+  // Only set when this user IS the client contact for a given Client
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id])
+
+  // Login management (admin panel)
+  isActive           Boolean   @default(true)
+  mustChangePassword Boolean   @default(false)
+  lastLoginAt        DateTime?
+  invitedAt          DateTime? // last time login details were emailed
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  assignedTasks       Task[]               @relation("TaskAssignee")
+  comments            Comment[]
+  approvals           Approval[]
+  notifications       Notification[]
+  activityLogs        ActivityLog[]
+  messages            Message[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([organizationId])
+  @@index([clientId])
+}
+
+model Role {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  name           RoleName
+  users          User[]
+  permissions    Permission[]
+
+  @@unique([organizationId, name])
+}
+
+model Permission {
+  id       String @id @default(cuid())
+  roleId   String
+  role     Role   @relation(fields: [roleId], references: [id])
+  resource String // e.g. "content", "client", "asset"
+  action   String // e.g. "create", "read", "update", "delete", "approve"
+
+  @@unique([roleId, resource, action])
+}
+
+// ---------- CLIENT / BRAND ----------
+
+model Client {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  name         String
+  logoUrl      String?
+  industry     String?
+  contactName  String?
+  contactEmail String?
+  notes        String?
+  status       String    @default("active") // active | paused | churned
+  createdBy    String
+  updatedBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  users       User[]
+  brands      Brand[]
+  contracts   Contract[]
+  invoices    Invoice[]
+  reports     Report[]
+  discussions Discussion[]
+  assets      Asset[]
+  services    ClientService[]
+
+  @@index([organizationId])
+}
+
+// The 28 service lines a 360 agency sells. A client with NO rows here is treated as "not yet configured"
+// and sees every content type (safe default for clients created before this feature existed).
+enum ServiceCategory {
+  STRATEGY
+  BRANDING
+  GRAPHIC_DESIGN
+  SOCIAL_MEDIA_MARKETING
+  CONTENT_CREATION
+  VIDEO_PRODUCTION
+  SEO
+  GOOGLE_SEARCH_MARKETING
+  META_ADVERTISING
+  PERFORMANCE_MARKETING
+  WEBSITE_DEVELOPMENT
+  ECOMMERCE_MARKETING
+  MARKETPLACE_MARKETING
+  EMAIL_MARKETING
+  WHATSAPP_MARKETING
+  INFLUENCER_MARKETING
+  LINKEDIN_B2B_MARKETING
+  YOUTUBE_MARKETING
+  ONLINE_REPUTATION_MANAGEMENT
+  CONVERSION_RATE_OPTIMIZATION
+  MARKETING_AUTOMATION
+  AI_MARKETING
+  APP_DEVELOPMENT
+  ANALYTICS_REPORTING
+  DIGITAL_PR
+  PERSONAL_BRANDING
+  LEAD_GENERATION
+  GROWTH_MARKETING
+}
+
+// One row per category the client has ever had an opinion on. Absence of a row = "unset", not "off"
+// (see allowedContentTypes in lib/services.ts) — that's what keeps existing clients working after migration.
+model ClientService {
+  id         String          @id @default(cuid())
+  clientId   String
+  client     Client          @relation(fields: [clientId], references: [id])
+  category   ServiceCategory
+  enabled    Boolean         @default(true)
+  scopeItems String[]        @default([]) // the specific line items purchased under this category, free text
+  notes      String?
+  updatedBy  String?
+  updatedAt  DateTime        @updatedAt
+  createdAt  DateTime        @default(now())
+
+  @@unique([clientId, category])
+  @@index([clientId])
+}
+
+model Brand {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id])
+
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  campaigns          Campaign[]
+  contentItems       ContentItem[]
+  assets             Asset[]
+  seoKeywords        SeoKeyword[]
+  adCampaigns        AdCampaign[]
+  analyticsSnapshots AnalyticsSnapshot[]
+  ideas              ContentIdea[]
+
+  @@index([clientId])
+}
+
+model Campaign {
+  id      String @id @default(cuid())
+  brandId String
+  brand   Brand  @relation(fields: [brandId], references: [id])
+
+  name      String
+  startDate DateTime?
+  endDate   DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  contentItems ContentItem[]
+  adCampaigns  AdCampaign[]
+
+  @@index([brandId])
+}
+
+// ---------- CONTENT OPERATIONS ----------
+
+model ContentCalendar {
+  id      String @id @default(cuid())
+  brandId String
+  month   Int
+  year    Int
+
+  items ContentItem[]
+
+  @@unique([brandId, month, year])
+}
+
+model ContentItem {
+  id         String           @id @default(cuid())
+  brandId    String
+  brand      Brand            @relation(fields: [brandId], references: [id])
+  campaignId String?
+  campaign   Campaign?        @relation(fields: [campaignId], references: [id])
+  calendarId String?
+  calendar   ContentCalendar? @relation(fields: [calendarId], references: [id])
+
+  type          ContentType
+  status        ContentStatus @default(DRAFT)
+  title         String
+  caption       String?
+  scheduledFor  DateTime?
+  scheduledTime String? // "HH:mm" — orders stories/posts within a day
+  publishedAt   DateTime?
+
+  // Planning pack: everything the team plans for this piece
+  objective       String? // why this piece exists
+  script          Json? // { hook, blocks: [{ title, copy, visual, duration }], cta }
+  visualBrief     String? // design / shoot direction
+  cta             String?
+  seoKeywords     String[] // first entry = primary keyword
+  hashtags        String[] // stored without the leading #
+  // Blog / long-form
+  seoTitle        String?
+  metaDescription String?
+  slug            String?
+  body            String?
+
+  // Production + publishing
+  creativeRound Int     @default(0) // 0 = production hasn't started; +1 every time work is (re)sent
+  publishedUrl  String? // link to the live post, added when marking Published
+
+  createdBy String
+  updatedBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  versions  ContentVersion[]
+  comments  Comment[]
+  approvals Approval[]
+  assets    Asset[]
+  tasks     Task[]
+  creatives Creative[]
+  idea      ContentIdea?
+
+  @@index([brandId])
+  @@index([status])
+  @@index([brandId, scheduledFor])
+}
+
+model ContentVersion {
+  id            String      @id @default(cuid())
+  contentItemId String
+  contentItem   ContentItem @relation(fields: [contentItemId], references: [id])
+
+  versionNumber Int
+  fileUrl       String?
+  caption       String?
+  snapshot      Json? // title, script, keywords, hashtags, blog fields at save time
+  createdBy     String
+  createdAt     DateTime @default(now())
+
+  @@index([contentItemId])
+}
+
+model Comment {
+  id            String       @id @default(cuid())
+  contentItemId String?
+  contentItem   ContentItem? @relation(fields: [contentItemId], references: [id])
+  discussionId  String?
+  discussion    Discussion?  @relation(fields: [discussionId], references: [id])
+
+  authorId      String
+  author        User      @relation(fields: [authorId], references: [id])
+  body          String
+  voiceNoteUrl  String?
+  screenshotUrl String?
+  createdAt     DateTime  @default(now())
+  deletedAt     DateTime?
+
+  @@index([contentItemId])
+  @@index([discussionId])
+}
+
+model Approval {
+  id            String           @id @default(cuid())
+  contentItemId String
+  contentItem   ContentItem      @relation(fields: [contentItemId], references: [id])
+  decidedById   String
+  decidedBy     User             @relation(fields: [decidedById], references: [id])
+  decision      ApprovalDecision
+  stage         ApprovalStage    @default(PLAN)
+  round         Int              @default(1) // creative review round (always 1 for PLAN)
+  note          String?
+  createdAt     DateTime         @default(now())
+
+  @@index([contentItemId])
+}
+
+// The finished work for a content item (video, images, PDF) or a link to it (Drive, Frame.io...).
+// Files live in Cloudflare R2 (storageKey) and are only ever served through /api/creatives/[id],
+// which checks tenant + review state and hands out a short-lived signed URL.
+model Creative {
+  id            String      @id @default(cuid())
+  contentItemId String
+  contentItem   ContentItem @relation(fields: [contentItemId], references: [id])
+
+  round      Int // matches ContentItem.creativeRound when uploaded
+  kind       CreativeKind @default(FILE)
+  fileName   String
+  mimeType   String?
+  sizeBytes  Int?
+  storageKey String? // R2 object key (FILE)
+  linkUrl    String? // external URL (LINK)
+  note       String?
+  position   Int          @default(0) // slide / frame order
+
+  uploadedBy String
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  @@index([contentItemId, round])
+}
+
+enum IdeaStatus {
+  IDEA
+  PLANNED
+  USED
+  ARCHIVED
+}
+
+enum IdeaPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// The "someday" bucket for a brand: ideas the team collects over time, independent of any date,
+// pulled into the calendar when there's a slot for them.
+model ContentIdea {
+  id      String @id @default(cuid())
+  brandId String
+  brand   Brand  @relation(fields: [brandId], references: [id])
+
+  title       String
+  notes       String?
+  contentType ContentType?
+  tags        String[]     @default([])
+  priority    IdeaPriority @default(MEDIUM)
+  status      IdeaStatus   @default(IDEA)
+
+  usedForId String?      @unique
+  usedFor   ContentItem? @relation(fields: [usedForId], references: [id])
+
+  createdBy String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([brandId, status])
+}
+
+// ---------- ASSETS ----------
+
+model Asset {
+  id            String       @id @default(cuid())
+  clientId      String?
+  client        Client?      @relation(fields: [clientId], references: [id])
+  brandId       String?
+  brand         Brand?       @relation(fields: [brandId], references: [id])
+  contentItemId String?
+  contentItem   ContentItem? @relation(fields: [contentItemId], references: [id])
+
+  folder    String // Brand Assets | Videos | Reels | ... (see spec)
+  fileName  String
+  fileUrl   String
+  fileType  String
+  sizeBytes Int?
+  tags      String[]
+  version   Int      @default(1)
+
+  uploadedBy String
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  @@index([clientId])
+  @@index([brandId])
+}
+
+// ---------- TASKS ----------
+
+model Task {
+  id            String       @id @default(cuid())
+  contentItemId String?
+  contentItem   ContentItem? @relation(fields: [contentItemId], references: [id])
+  projectId     String?
+  project       Project?     @relation(fields: [projectId], references: [id])
+  parentTaskId  String?
+  parentTask    Task?        @relation("Subtasks", fields: [parentTaskId], references: [id])
+  subtasks      Task[]       @relation("Subtasks")
+
+  title            String
+  description      String?
+  status           TaskStatus @default(TODO)
+  assigneeId       String?
+  assignee         User?      @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  dueDate          DateTime?
+  checklist        Json?
+  timeSpentMinutes Int        @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([assigneeId])
+  @@index([status])
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  tasks Task[]
+}
+
+// ---------- COMMUNICATION ----------
+
+// One thread per client — a running channel between the agency and that client, separate from
+// per-content-item comments. Created on first message (see lib/chat.ts).
+model Discussion {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id])
+  title     String   @default("General")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  comments Comment[]
+  messages Message[]
+  reads    ChatRead[]
+
+  @@unique([clientId])
+}
+
+model Message {
+  id           String     @id @default(cuid())
+  discussionId String
+  discussion   Discussion @relation(fields: [discussionId], references: [id])
+  senderId     String
+  sender       User       @relation(fields: [senderId], references: [id])
+  body         String
+  createdAt    DateTime   @default(now())
+
+  @@index([discussionId, createdAt])
+}
+
+// Per-user read marker for a thread, used only to compute unread counts.
+model ChatRead {
+  id           String     @id @default(cuid())
+  discussionId String
+  discussion   Discussion @relation(fields: [discussionId], references: [id])
+  userId       String
+  lastReadAt   DateTime   @default(now())
+
+  @@unique([discussionId, userId])
+}
+
+// ---------- REPORTING ----------
+
+model Report {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id])
+
+  month     Int
+  year      Int
+  sections  Json // { contentPerformance, adPerformance, seoPerformance, analytics, leadGen, nextMonthPlan }
+  pdfUrl    String?
+  createdAt DateTime @default(now())
+}
+
+model Lead {
+  id        String   @id @default(cuid())
+  brandId   String?
+  source    String?
+  name      String?
+  email     String?
+  phone     String?
+  createdAt DateTime @default(now())
+}
+
+// ---------- ADS ----------
+
+model AdCampaign {
+  id         String     @id @default(cuid())
+  brandId    String
+  brand      Brand      @relation(fields: [brandId], references: [id])
+  campaignId String?
+  campaign   Campaign?  @relation(fields: [campaignId], references: [id])
+  platform   AdPlatform
+  name       String
+  budget     Float?
+  startDate  DateTime?
+  endDate    DateTime?
+
+  metrics AdMetric[]
+
+  @@index([brandId])
+}
+
+model AdMetric {
+  id           String     @id @default(cuid())
+  adCampaignId String
+  adCampaign   AdCampaign @relation(fields: [adCampaignId], references: [id])
+  date         DateTime
+  spend        Float?
+  impressions  Int?
+  clicks       Int?
+  conversions  Int?
+
+  @@index([adCampaignId])
+}
+
+// ---------- SEO ----------
+
+model SeoKeyword {
+  id        String    @id @default(cuid())
+  brandId   String
+  brand     Brand     @relation(fields: [brandId], references: [id])
+  keyword   String
+  targetUrl String?
+  rank      Int?
+  checkedAt DateTime?
+
+  @@index([brandId])
+}
+
+// ---------- ANALYTICS ----------
+
+model AnalyticsSnapshot {
+  id      String   @id @default(cuid())
+  brandId String
+  brand   Brand    @relation(fields: [brandId], references: [id])
+  source  String // ga4 | search_console | gtm
+  date    DateTime
+  metrics Json
+
+  @@index([brandId])
+}
+
+// ---------- BILLING (manual v1) ----------
+
+model Contract {
+  id        String    @id @default(cuid())
+  clientId  String
+  client    Client    @relation(fields: [clientId], references: [id])
+  fileUrl   String
+  signedAt  DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model Invoice {
+  id        String    @id @default(cuid())
+  clientId  String
+  client    Client    @relation(fields: [clientId], references: [id])
+  amount    Float
+  status    String    @default("unpaid") // unpaid | paid | overdue
+  dueDate   DateTime?
+  fileUrl   String?
+  createdAt DateTime  @default(now())
+}
+
+// ---------- SYSTEM ----------
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model AuditTrail {
+  id         String   @id @default(cuid())
+  entityType String
+  entityId   String
+  changedBy  String
+  diff       Json
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+// Password reset links. Only the SHA-256 hash of the token is stored; the raw token exists only in the email.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
